@@ -1,0 +1,19 @@
+site_name: TaskFlow Internal Developer Portal
+site_description: Internal Developer Portal for the TaskFlow platform
+
+repo_url: https://github.com/OnyiGlobal2025/taskflow-backstage
+edit_uri: edit/main/docs/
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+
+plugins:
+  - techdocs-core
+
+markdown_extensions:
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
