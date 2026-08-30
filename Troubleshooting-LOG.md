@@ -644,3 +644,241 @@ This was the *local machine* failing to resolve the cluster endpoint (USB tether
 **Docker Desktop not running**, producing `error during connect: ... dockerDesktopLinuxEngine`. Started it and retried.
 
 Neither is worth a full entry, but both are worth recognising quickly rather than debugging as if they were application problems.
+
+## Issue 23: GitHub OAuth sign-in — stale Docker bundle masked three separate faults
+
+**Phase:** Project 5, Phase 4 (GitHub Auth & Software Catalog)
+**Date:** 2026-08-30
+
+### Symptom
+
+After replacing guest auth with GitHub OAuth in `app-config.yaml`, the portal loaded straight into the catalog with no sign-in page at all, and every catalog request returned 401:
+
+```json
+{"method":"GET","status":401,"url":"/api/catalog/entities/by-query?..."}
+{"method":"GET","status":200,"url":"/.backstage/health/v1/liveness"}
+```
+
+Probes returned 200 while the API returned 401 — the backend was healthy and rejecting unauthenticated calls. The frontend had never authenticated because it presented no way to do so.
+
+### The root cause that hid everything else
+
+**Backstage's backend Dockerfile does not build the application.** It packages a pre-built artifact:
+
+```dockerfile
+# yarn install --immutable
+# yarn tsc
+# yarn build:backend
+# Once the commands have been run, you can build the image using `yarn build-image`
+...
+COPY --chown=node:node packages/backend/dist/bundle.tar.gz app-config*.yaml ./
+RUN tar xzf bundle.tar.gz && rm bundle.tar.gz
+```
+
+The instructions are in comments at the top of the file. Without running `yarn build:backend` first, `docker build` succeeds and produces a valid image — containing whatever `bundle.tar.gz` was last generated.
+
+This produced a deeply misleading failure pattern:
+
+- **YAML config changes worked**, because `app-config*.yaml` is copied separately on the same line, outside the bundle.
+- **Code changes silently did not**, because `App.tsx` compiles into `bundle.tar.gz`.
+
+Every earlier fix in Phase 3 — SSL, probe paths, catalog locations — was YAML, so everything appeared to be working normally. The first code change of the project was the sign-in page, and it vanished without a trace. `docker build` reported success, `docker push` reported a new digest (the config layers had genuinely changed), and the pod restarted cleanly. Nothing in the tooling indicated a problem.
+
+### How it was finally caught
+
+Instead of trusting the build, grep the running container for a string that only exists in the new code:
+
+```bash
+POD=$(kubectl get pods -n backstage -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n backstage $POD -- sh -c \
+  "grep -rl 'Sign in using GitHub' . --include=*.js 2>/dev/null | head -3"
+```
+
+Empty result → the code is not in the image, regardless of what the build output said.
+
+After `yarn build:backend` and a rebuild, the same command returned:
+
+```
+./packages/app/dist/static/main.91cd6a1938f1.js
+```
+
+### Correct build sequence
+
+```bash
+cd taskflow-backstage
+nvm use 22
+yarn install --immutable      # only when dependencies changed
+yarn tsc
+yarn build:backend            # regenerates packages/backend/dist/bundle.tar.gz
+docker build -f packages/backend/Dockerfile -t <ecr-url>:latest .
+docker push <ecr-url>:latest
+kubectl rollout restart deployment/backstage -n backstage
+```
+
+**Rule of thumb:** config-only change → Docker build alone is sufficient. Any change under `packages/*/src/` → `yarn build:backend` first, without exception.
+
+---
+
+### The three real faults, once the build was fixed
+
+The stale bundle meant fixes were applied and then discarded, which made it impossible to tell a wrong fix from an undelivered one. Three genuine faults existed, found in this order:
+
+#### Fault 1 — sign-in page is a code extension, not YAML config
+
+In the new frontend system, `app.auth.providers` in `app-config.yaml` does **not** produce a sign-in page. The `signInPage` input on the `app/root` extension is marked `internal: true` in the type definitions, meaning it can only be attached from code:
+
+```typescript
+signInPage: ExtensionInput<ConfigurableExtensionDataRef<
+  ComponentType<SignInPageProps>>, "core.sign-in-page.component", {}>, {
+    singleton: true;
+    optional: true;
+    internal: true;
+  }
+```
+
+Two attempts to enable it via `app-config.yaml` (`app.auth.providers.github: {}` and an `extensions: - sign-in-page:app` entry) were both wrong. The correct approach is `SignInPageBlueprint` in `packages/app/src/App.tsx`:
+
+```tsx
+import { githubAuthApiRef } from '@backstage/core-plugin-api';
+import { SignInPageBlueprint } from '@backstage/plugin-app-react';
+import { SignInPage } from '@backstage/core-components';
+import { createFrontendModule } from '@backstage/frontend-plugin-api';
+
+const signInPage = SignInPageBlueprint.make({
+  params: {
+    loader: async () => props => (
+      <SignInPage
+        {...props}
+        provider={{
+          id: 'github-auth-provider',
+          title: 'GitHub',
+          message: 'Sign in using GitHub',
+          apiRef: githubAuthApiRef,
+        }}
+      />
+    ),
+  },
+});
+
+export default createApp({
+  features: [
+    catalogPlugin,
+    techDocsPlugin,
+    techDocsMermaidAddonModule,
+    navModule,
+    createFrontendModule({
+      pluginId: 'app',
+      extensions: [signInPage],
+    }),
+  ],
+});
+```
+
+#### Fault 2 — browser served a stale JS bundle
+
+Once the sign-in page deployed, Chrome continued rendering the cached catalog page with 401 errors. Opening the same URL in a different browser immediately showed a sign-in page — proving the deployment was fine and the browser was not.
+
+Frontend assets are bundled into the image and served from a fixed origin (`localhost:7007`), so an aggressive cache can survive many redeploys. **When debugging a frontend change, verify in a browser that has never loaded the app**, or hard-reload with `Ctrl+Shift+R` and DevTools → Network → Disable cache.
+
+#### Fault 3 — backend auth provider module never registered
+
+With a working sign-in page, clicking SIGN IN returned:
+
+```json
+{"error":{"name":"NotFoundError","message":"Unknown auth provider 'github'"},
+ "response":{"statusCode":404}}
+```
+
+`@backstage/plugin-auth-backend-module-github-provider` was present in `packages/backend/package.json` — but installing a package does not register it. `packages/backend/src/index.ts` still registered only the guest provider:
+
+```typescript
+backend.add(import('@backstage/plugin-auth-backend'));
+backend.add(import('@backstage/plugin-auth-backend-module-guest-provider'));
+```
+
+Fix — replace the guest module with the GitHub one:
+
+```typescript
+backend.add(import('@backstage/plugin-auth-backend-module-github-provider'));
+```
+
+---
+
+### Full working configuration
+
+**GitHub OAuth App** (github.com/settings/developers):
+- Homepage URL: `http://localhost:7007`
+- Redirect URI: `http://localhost:7007/api/auth/github/handler/frame` — must match exactly; GitHub rejects any variation, including a trailing slash
+- Device Flow: disabled (not used by the browser redirect flow)
+
+Note: GitHub's UI now labels this field **Redirect URI**, not "Authorization callback URL" as most documentation still says.
+
+**`app-config.yaml`:**
+
+```yaml
+auth:
+  environment: production
+  providers:
+    github:
+      production:
+        clientId: ${AUTH_GITHUB_CLIENT_ID}
+        clientSecret: ${AUTH_GITHUB_CLIENT_SECRET}
+        signIn:
+          resolvers:
+            - resolver: usernameMatchingUserEntityName
+```
+
+`environment: production` selects which nested provider block is read; the nested key must match it.
+
+**Identity resolution.** `usernameMatchingUserEntityName` maps the GitHub login onto a `User` entity of the same name. The catalog's User entity was `onyedika` while the actual GitHub login is `OnyiGlobal2025` — a mismatch that would have failed sign-in with "unable to resolve user identity". Fixed by renaming the entity in `catalog-org.yaml` rather than swapping to a looser resolver, which keeps the catalog accurate about who owns what:
+
+```yaml
+apiVersion: backstage.io/v1alpha1
+kind: User
+metadata:
+  name: OnyiGlobal2025
+spec:
+  memberOf:
+    - platform-team
+```
+
+**Kubernetes secret** — two new keys alongside the existing PAT and DB password:
+
+```bash
+kubectl create secret generic backstage-secrets \
+  --namespace backstage \
+  --from-literal=GITHUB_TOKEN='<pat>' \
+  --from-literal=POSTGRES_PASSWORD='<password>' \
+  --from-literal=AUTH_GITHUB_CLIENT_ID='<client-id>' \
+  --from-literal=AUTH_GITHUB_CLIENT_SECRET='<client-secret>'
+```
+
+Verified with the Issue 19 length check across all four keys before deploying — 40, 11, 20, 40.
+
+**Helm Deployment** — two additional `secretKeyRef` entries for `AUTH_GITHUB_CLIENT_ID` and `AUTH_GITHUB_CLIENT_SECRET`, matching the `${...}` placeholders in `app-config.yaml`.
+
+### Result
+
+Sign-in page renders a GitHub card → SIGN IN opens GitHub's OAuth flow ("to continue to TaskFlow Backstage") → after authorising, the catalog loads showing **Owned Components (4)**.
+
+That "Owned" count is the meaningful verification. It only resolves if the full chain works: GitHub identity → `OnyiGlobal2025` User entity → `platform-team` membership → ownership of all four components. A plain catalog listing would prove sign-in; the Owned filter proves identity resolution.
+
+---
+
+### Security note — credential exposure during this session
+
+A screenshot shared during debugging showed `app-config.local.yaml` open in the editor with the GitHub PAT in plaintext. The file is git-ignored and the token never reached GitHub, but it was visible in the image. The token was revoked at github.com/settings/tokens, a replacement generated, and the Kubernetes secret recreated.
+
+**Practice going forward:** close or crop files containing credentials before screenshotting. Git-ignoring a file protects the repository, not the screen.
+
+---
+
+### Lessons
+
+- **A successful `docker build` does not mean your code is in the image.** When the Dockerfile packages a pre-built artifact, the build can succeed while shipping stale code, with no warning anywhere in the output. Read the Dockerfile before trusting the build.
+- **Verify deployment by inspecting the artifact, not the tooling.** `grep` for a known-new string inside the running container. This single check would have saved several rebuild cycles.
+- **When a fix "doesn't work" repeatedly, question the delivery mechanism before the fix.** Three plausible fixes appeared to fail in a row; none of them were ever actually deployed. The pattern of *everything* failing is itself evidence that the changes aren't arriving.
+- **Config-vs-code is the axis that mattered here.** Understanding that `app-config*.yaml` is copied outside the bundle explains precisely why Phase 3's fixes all worked and Phase 4's first fix did not.
+- **Read type definitions when documentation is ambiguous.** `internal: true` on the `signInPage` input was the definitive signal that no YAML syntax would ever work — available locally in `node_modules`, faster and more reliable than guessing at config keys.
+- **Browser cache is part of the deployment surface for frontend work.** Always verify in a clean browser profile.
+- **Installing a package is not the same as registering it.** Backstage backend modules require an explicit `backend.add(import(...))`; presence in `package.json` proves nothing about whether the provider is active.
