@@ -47,6 +47,16 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.existingSecret }}
                   key: GITHUB_TOKEN
+            - name: AUTH_GITHUB_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: AUTH_GITHUB_CLIENT_ID
+            - name: AUTH_GITHUB_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: AUTH_GITHUB_CLIENT_SECRET
           resources:
 {{ toYaml .Values.resources | indent 12 }}
           readinessProbe:

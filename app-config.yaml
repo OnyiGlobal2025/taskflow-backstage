@@ -1,9 +1,6 @@
 app:
   title: Scaffolded Backstage App
   baseUrl: http://localhost:3000
-  auth:
-    providers:
-      github: {}
 
   # Enable all packages by default, this will discover packages from packages/app/package.json
   packages: all
@@ -13,7 +10,7 @@ app:
     - page:catalog:
         config:
           path: /
-
+    
 organization:
   name: My Company
 
