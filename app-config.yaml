@@ -1,6 +1,9 @@
 app:
   title: Scaffolded Backstage App
   baseUrl: http://localhost:3000
+  auth:
+    providers:
+      github: {}
 
   # Enable all packages by default, this will discover packages from packages/app/package.json
   packages: all
@@ -78,12 +81,16 @@ techdocs:
     type: 'local' # Alternatives - 'googleGcs' or 'awsS3'. Read documentation for using alternatives.
 
 auth:
-  # see https://backstage.io/docs/auth/ to learn about auth providers
+  environment: production
   providers:
-    # See https://backstage.io/docs/auth/guest/provider
-    guest: {}
-  # see https://backstage.io/docs/ai/mcp-actions#client-id-metadata-documents
-  # to learn more about client id metadata documents
+    github:
+      production:
+        clientId: ${AUTH_GITHUB_CLIENT_ID}
+        clientSecret: ${AUTH_GITHUB_CLIENT_SECRET}
+        signIn:
+          resolvers:
+            - resolver: usernameMatchingUserEntityName
+ 
   clientIdMetadataDocuments:
     enabled: false
     # Optional: restrict which `client_id` URLs are allowed (defaults to ['*'])
