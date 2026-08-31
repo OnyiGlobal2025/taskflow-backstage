@@ -46,6 +46,14 @@ jobs:
           pip install mkdocs-techdocs-core
           npm install -g @techdocs/cli
 
+      # TEMPORARY — remove once OIDC is confirmed working.
+      # Prints the exact subject claim AWS will receive.
+      - name: Debug OIDC claims
+        run: |
+          echo "repository: $GITHUB_REPOSITORY"
+          echo "ref: $GITHUB_REF"
+          echo "expected sub: repo:$GITHUB_REPOSITORY:ref:$GITHUB_REF"
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
