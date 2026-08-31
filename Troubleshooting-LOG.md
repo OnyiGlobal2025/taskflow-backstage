@@ -882,3 +882,235 @@ A screenshot shared during debugging showed `app-config.local.yaml` open in the 
 - **Read type definitions when documentation is ambiguous.** `internal: true` on the `signInPage` input was the definitive signal that no YAML syntax would ever work — available locally in `node_modules`, faster and more reliable than guessing at config keys.
 - **Browser cache is part of the deployment surface for frontend work.** Always verify in a clean browser profile.
 - **Installing a package is not the same as registering it.** Backstage backend modules require an explicit `backend.add(import(...))`; presence in `package.json` proves nothing about whether the provider is active.
+
+## Issue 24 — Interrupted `terraform apply` left orphaned AWS resources
+
+**Phase:** 5 (TechDocs) — infrastructure rebuild
+
+**Symptom**
+
+An in-progress `terraform apply` was interrupted. The retry failed with:
+
+```
+Error: Saved plan is stale
+
+The given plan file can no longer be applied because the state was changed by
+another operation after the plan was created.
+```
+
+Discarding the plan and re-applying then produced a cascade of conflicts:
+
+```
+Error: creating IAM Policy (taskflow-github-actions-policy): EntityAlreadyExists
+Error: creating IAM OIDC Provider: EntityAlreadyExists
+Error: creating IAM Role (alb-controller-irsa-role): EntityAlreadyExists
+Error: creating IAM Role (taskflow-backstage-role): EntityAlreadyExists
+Error: creating EKS Node Group: ResourceInUseException
+Error: serviceaccounts "aws-load-balancer-controller" already exists
+```
+
+**Cause**
+
+The interruption killed Terraform after it had created resources in AWS but before it
+recorded them in remote state. On the next run Terraform saw them as missing and tried
+to create them a second time. AWS rejected each one as a duplicate.
+
+The "stale plan" error is separate and is Terraform behaving correctly: a saved plan is
+only valid against the state it was computed from. Because the partial apply had moved
+state forward, applying the old plan would have meant applying something never reviewed.
+
+**Fix**
+
+Imported each orphaned resource into state rather than deleting it from AWS. Deletion
+was the wrong move here — the OIDC provider and node group were live and depended on by
+other resources, so removing them would have forced a much larger rebuild.
+
+```bash
+terraform import aws_iam_policy.github_actions \
+  arn:aws:iam::713923090919:policy/taskflow-github-actions-policy
+
+terraform import aws_iam_openid_connect_provider.eks \
+  arn:aws:iam::713923090919:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/2E8BA331717B2E36BCA4B97B18D71CBB
+
+terraform import aws_iam_role.alb_controller alb-controller-irsa-role
+
+terraform import aws_iam_role.backstage taskflow-backstage-role
+
+terraform import aws_eks_node_group.taskflow_eks_node_group \
+  taskflow-eks-cluster:taskflow-eks-node-group
+
+terraform import kubernetes_service_account_v1.alb_controller \
+  kube-system/aws-load-balancer-controller
+```
+
+A final `terraform apply` then reported:
+
+```
+No changes. Your infrastructure matches the configuration.
+Apply complete! Resources: 0 added, 0 changed, 0 destroyed.
+```
+
+**Takeaway**
+
+Import ID formats differ by resource type and are the main thing to get right:
+
+| Resource type | Import ID format | Example |
+|---|---|---|
+| IAM policy / role / OIDC provider | full ARN (roles accept bare name) | `arn:aws:iam::…:policy/name` |
+| EKS node group | `cluster:nodegroup` | `taskflow-eks-cluster:taskflow-eks-node-group` |
+| Kubernetes resource | `namespace/name` | `kube-system/aws-load-balancer-controller` |
+
+Also: an interrupted apply is recoverable. The instinct to `terraform destroy` and start
+clean is expensive and unnecessary — Terraform is declarative, and import is the correct
+tool for reconciling drift between reality and state.
+
+---
+
+## Issue 25 — GitHub immutable subject claims broke OIDC federation into AWS
+
+**Phase:** 5 (TechDocs) — CI publish workflow
+
+**Symptom**
+
+The TechDocs publish workflow failed at the AWS authentication step, in
+`taskflow-backstage` only. The identical pattern had worked in older repos for months.
+
+```
+Assuming role with OIDC
+Assuming role with OIDC
+… (13 retries, ~90 seconds)
+Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+**Diagnosis path (what was ruled out)**
+
+1. **Trust policy `sub` too narrow** — it was scoped to a single repo. Widened it to all
+   four `taskflow-*` repos and re-applied. Same failure.
+2. **Live trust policy not matching the code** — checked what AWS was actually enforcing
+   with `aws iam get-role --role-name taskflow-github-actions-role
+   --query 'Role.AssumeRolePolicyDocument'`. All four repos were present. Not it.
+3. **OIDC provider audience wrong** — checked with
+   `aws iam get-open-id-connect-provider`. `ClientIDList` contained `sts.amazonaws.com`.
+   Not it.
+4. **Repository Actions permissions** — set to "Allow all actions and reusable
+   workflows", the most permissive option. Not it.
+5. **Debug step printing the expected subject** — added a temporary step echoing
+   `repo:$GITHUB_REPOSITORY:ref:$GITHUB_REF`. It printed
+   `repo:OnyiGlobal2025/taskflow-backstage:ref:refs/heads/main`, which *should* have
+   matched the wildcard in the trust policy. This is what proved the assumption itself
+   was wrong: those are environment variables, not the real token claim.
+
+**The tell**
+
+A genuine `sub` mismatch fails immediately. This failure retried ~13 times with backoff
+over 90 seconds, which pointed at the token request rather than the policy evaluation.
+
+**Cause**
+
+Under **Settings → Actions → OIDC**, the repo showed "Use immutable subject claim"
+checked *and greyed out*, with the note: repositories created or renamed after
+**15 July 2026** use immutable subject claims. It is enabled automatically and cannot be
+turned off.
+
+The subject claim GitHub actually sends embeds numeric org and repo IDs:
+
+```
+repo:OnyiGlobal2025@232406732/taskflow-backstage@1330063776
+```
+
+The legacy pattern `repo:OnyiGlobal2025/taskflow-backstage:*` can never match this, no
+matter how the wildcard is written. The three older repos predate the cutoff and still
+send the classic format — which is exactly why only the newest repo failed.
+
+**Fix**
+
+Held both formats in the trust policy `sub` array — immutable for the new repo, legacy
+for the three older ones:
+
+```hcl
+StringLike = {
+  "token.actions.githubusercontent.com:sub" = [
+    "repo:OnyiGlobal2025/taskflow-app:*",
+    # Immutable subject claim — repos created after 2026-07-15 embed
+    # numeric org/repo IDs. Automatically enabled, cannot be disabled.
+    "repo:OnyiGlobal2025@232406732/taskflow-backstage@1330063776:*",
+    "repo:OnyiGlobal2025/taskflow-infra:*",
+    "repo:OnyiGlobal2025/taskflow-gitops:*",
+  ]
+}
+```
+
+After apply, authentication succeeded in **1 second**:
+
+```
+Assuming role with OIDC
+Authenticated as assumedRoleId AROA2MOJB3HTZ7MKRDUPY:GitHubActions
+```
+
+**Takeaway**
+
+The exact subject prefix for any repo is displayed under **Settings → Actions → OIDC**
+as "Default subject claim prefix" — copy it from there rather than constructing it by
+hand. Any repo created from mid-2026 onward will need this format, so new repos in an
+org will fail against a trust policy that works fine for existing ones.
+
+Worth noting the diagnostic lesson too: echoing `$GITHUB_REPOSITORY` in a workflow shows
+what the *runner* knows, not what the *token* contains. When those two disagree, only the
+provider's own configuration page settles it.
+
+---
+
+## Issue 26 — `techdocs-cli generate` rejects pymdownx custom fences
+
+**Phase:** 5 (TechDocs) — docs build
+
+**Symptom**
+
+With OIDC fixed, the workflow moved on and failed at the build step instead:
+
+```
+info: Generating documentation...
+Unsupported Python YAML tag 'tag:yaml.org,2002:python/name:pymdownx.superfences.fence_code_format'
+Error: Process completed with exit code 1.
+```
+
+**Cause**
+
+All four `mkdocs.yml` files carried a Mermaid custom-fence block:
+
+```yaml
+markdown_extensions:
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+```
+
+The `!!python/name:` tag instructs the YAML parser to resolve a live Python object.
+`techdocs-cli` loads `mkdocs.yml` with a strict loader that refuses to execute object
+references — a reasonable security posture, since the tag is arbitrary code execution
+from a config file.
+
+**Fix**
+
+Removed the `markdown_extensions` block entirely from all four repos. No replacement
+needed: Mermaid is rendered **client-side** by the TechDocs addon in the Backstage
+frontend, not by MkDocs at build time. Plain fenced blocks work as-is:
+
+````markdown
+```mermaid
+graph LR
+  A[Developer] --> B[Backstage]
+```
+````
+
+Confirmed by the rendered architecture page — the request-flow diagram displays correctly
+in the portal with no MkDocs configuration at all.
+
+**Takeaway**
+
+Config that works under `mkdocs serve` locally will not necessarily survive
+`techdocs-cli generate`. The CLI is the stricter of the two, so it is the one to build
+against. More generally: when a plugin exists on both sides of a pipeline, check which
+side actually needs to do the work before configuring both.
