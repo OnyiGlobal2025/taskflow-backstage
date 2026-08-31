@@ -11,9 +11,7 @@ nav:
 plugins:
   - techdocs-core
 
-markdown_extensions:
-  - pymdownx.superfences:
-      custom_fences:
-        - name: mermaid
-          class: mermaid
-          format: !!python/name:pymdownx.superfences.fence_code_format
+# Note: no pymdownx.superfences custom_fences block.
+# The `!!python/name:` YAML tag is rejected by techdocs-cli's strict loader.
+# Mermaid is rendered client-side by the TechDocs addon in the Backstage
+# frontend, so plain ```mermaid fenced blocks work without MkDocs config.
