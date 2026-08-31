@@ -15,6 +15,7 @@ spec:
       labels:
         app: {{ .Release.Name }}
     spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
       volumes:
         - name: rds-ca
           configMap:
@@ -57,6 +58,10 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.existingSecret }}
                   key: AUTH_GITHUB_CLIENT_SECRET
+            - name: TECHDOCS_S3_BUCKET_NAME
+              value: {{ .Values.techdocs.bucket | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.techdocs.region | quote }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
           readinessProbe:

@@ -11,9 +11,17 @@ service:
 
 existingSecret: backstage-secrets
 
+serviceAccount:
+  name: backstage
+  roleArn: "arn:aws:iam::713923090919:role/taskflow-backstage-role"
+
+techdocs:
+  bucket: onyiglobal-techdocs-bucket
+  region: us-east-1
+
 rdsCa:
   configMapName: rds-ca-bundle
-  fileName: rds-ca-us-east-1.pem
+  filename: rds-ca-us-east-1.pem
   mountPath: /etc/ssl/rds
 
 postgres:
@@ -23,7 +31,7 @@ postgres:
 
 probes:
   readinessPath: /.backstage/health/v1/readiness
-  livenessPath: /.backstage/health/v1/liveness 
+  livenessPath: /.backstage/health/v1/liveness
 
 backstage:
   baseUrl: http://localhost:7007
