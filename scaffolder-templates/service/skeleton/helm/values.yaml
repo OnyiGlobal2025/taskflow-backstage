@@ -1,0 +1,21 @@
+replicaCount: 2
+
+image:
+  repository: 713923090919.dkr.ecr.us-east-1.amazonaws.com/${{ values.name }}
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 5000
+
+probes:
+  path: /healthz
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

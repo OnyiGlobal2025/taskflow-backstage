@@ -1,0 +1,11 @@
+{
+  "name": "${{ values.name }}",
+  "version": "0.1.0",
+  "description": "${{ values.description }}",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "license": "UNLICENSED"
+}

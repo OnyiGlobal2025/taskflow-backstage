@@ -39,6 +39,10 @@ catalog:
       target: https://github.com/OnyiGlobal2025/taskflow-backstage/blob/main/catalog-org.yaml
       rules:
         - allow: [User, Group]
+    - type: url
+      target: https://github.com/OnyiGlobal2025/taskflow-backstage/blob/main/scaffolder-templates/service/template.yaml
+      rules:
+        - allow: [Template]
 
 techdocs:
   # 'external' means Backstage never builds docs itself — CI does, and
