@@ -58,6 +58,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.existingSecret }}
                   key: AUTH_GITHUB_CLIENT_SECRET
+            - name: ARGOCD_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: ARGOCD_AUTH_TOKEN      
             - name: TECHDOCS_S3_BUCKET_NAME
               value: {{ .Values.techdocs.bucket | quote }}
             - name: AWS_REGION

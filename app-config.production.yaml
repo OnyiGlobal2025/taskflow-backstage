@@ -55,3 +55,31 @@ techdocs:
       region: ${AWS_REGION}
       # No credentials block — the AWS SDK picks up the IRSA web identity
       # token projected into the pod by the annotated service account.
+
+kubernetes:
+  serviceLocatorMethod:
+    type: 'multiTenant'
+  clusterLocatorMethods:
+    - type: 'config'
+      clusters:
+        - name: taskflow-eks-cluster
+          # The in-cluster API server address. Backstage watches the cluster
+          # it is deployed into, using the service account token and CA that
+          # Kubernetes projects into every pod.
+          url: https://kubernetes.default.svc
+          authProvider: 'serviceAccount'
+          serviceAccountToken:
+            $file: /var/run/secrets/kubernetes.io/serviceaccount/token
+          caFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          skipTLSVerify: false
+
+proxy:
+  endpoints:
+    # The ArgoCD frontend plugin calls Backstage at /api/proxy/argocd/api,
+    # which forwards to argocd-server over the cluster network. ArgoCD runs
+    # with server.insecure=true, so this is plain HTTP inside the cluster.
+    '/argocd/api':
+      target: http://argocd-server.argocd.svc.cluster.local
+      changeOrigin: true
+      headers:
+        Cookie: argocd.token=${ARGOCD_AUTH_TOKEN}
