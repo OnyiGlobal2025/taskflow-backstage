@@ -81,5 +81,6 @@ proxy:
     '/argocd/api':
       target: http://argocd-server.argocd.svc.cluster.local/api/v1/
       changeOrigin: true
+      credentials: dangerously-allow-unauthenticated
       headers:
         Authorization: Bearer ${ARGOCD_AUTH_TOKEN}
