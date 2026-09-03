@@ -82,4 +82,4 @@ proxy:
       target: http://argocd-server.argocd.svc.cluster.local/api/v1/
       changeOrigin: true
       headers:
-        Cookie: argocd.token=${ARGOCD_AUTH_TOKEN}
+        Authorization: Bearer ${ARGOCD_AUTH_TOKEN}
