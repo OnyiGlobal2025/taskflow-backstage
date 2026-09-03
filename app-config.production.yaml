@@ -79,7 +79,7 @@ proxy:
     # which forwards to argocd-server over the cluster network. ArgoCD runs
     # with server.insecure=true, so this is plain HTTP inside the cluster.
     '/argocd/api':
-      target: http://argocd-server.argocd.svc.cluster.local
+      target: http://argocd-server.argocd.svc.cluster.local/api/v1/
       changeOrigin: true
       headers:
         Cookie: argocd.token=${ARGOCD_AUTH_TOKEN}
