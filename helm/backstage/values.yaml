@@ -2,7 +2,9 @@ replicaCount: 1
 
 image:
   repository: 713923090919.dkr.ecr.us-east-1.amazonaws.com/taskflow-backstage
-  tag: phase7-fix4
+  # tag is supplied at deploy time: --set image.tag=$(git rev-parse --short HEAD)
+  # deliberately absent so the chart never claims a stale commit
+  tag: ""
   pullPolicy: Always
 
 service:

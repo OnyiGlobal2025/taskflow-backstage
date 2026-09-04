@@ -10,6 +10,7 @@ import { SignInPage } from '@backstage/core-components';
 import { createFrontendModule } from '@backstage/frontend-plugin-api';
 import { EntityCardBlueprint } from '@backstage/plugin-catalog-react/alpha';
 import { compatWrapper } from '@backstage/core-compat-api';
+import { useEntity } from '@backstage/plugin-catalog-react';
 
 const signInPage = SignInPageBlueprint.make({
   params: {
@@ -31,10 +32,16 @@ const argoCdOverviewCard = EntityCardBlueprint.make({
   name: 'argocd-overview',
   params: {
     filter: 'has:annotation:argocd/app-name',
-    loader: () =>
-      import('@roadiehq/backstage-plugin-argo-cd').then(m =>
-        compatWrapper(<m.EntityArgoCDOverviewCard />),
-      ),
+    loader: async () => {
+      const { EntityArgoCDOverviewCard } = await import(
+        '@roadiehq/backstage-plugin-argo-cd'
+      );
+      const Wrapper = () => {
+        const { entity } = useEntity();
+        return compatWrapper(<EntityArgoCDOverviewCard entity={entity} />);
+      };
+      return <Wrapper />;
+    },
   },
 });
 
