@@ -1868,4 +1868,15 @@ Workload discovery depends on the `backstage.io/kubernetes-id: taskflow-app` lab
 ## Open items
 
 - **ArgoCD overview card does not render.** Only the history card appears. Both are registered via `EntityCardBlueprint` + `compatWrapper` under `pluginId: 'catalog'` in `App.tsx`. Likely an extension attachment-point issue in the new frontend system rather than a config or auth problem — the history card proves the plugin, the proxy, and the token all work.
-- **`taskflow` ECR repo emptied between sessions.** Lifecycle policy ruled out (`lastEvaluatedAt` is epoch). Suspect a Terraform destroy/recreate cycle on the repo resource. Confirm before the next rebuild.
+- **Persistent resources are tied to ephemeral state — fix in Phase 8.** The TechDocs
+  S3 bucket (`techdocs.tf`) and the `taskflow` ECR repo live in the same Terraform
+  state as EKS/VPC/RDS, so `terraform destroy` deletes them and the next apply
+  recreates them empty. Consequence every session: TechDocs must be republished by
+  manually re-running the `techdocs.yml` workflow in all four repos, and the TaskFlow
+  backend/frontend images must be rebuilt and pushed before ArgoCD can sync.
+  Neither has any dependency on the cluster — both should outlive it.
+  **Fix:** split Terraform into two states — persistent (S3 bucket, ECR repos) applied
+  once and left alone, ephemeral (VPC, EKS, RDS) destroyed each session. Requires
+  `terraform state mv` or re-import. Rejected `prevent_destroy = true` as an
+  alternative: it makes `terraform destroy` fail rather than skip, forcing targeted
+  destroys every session.
