@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: 713923090919.dkr.ecr.us-east-1.amazonaws.com/taskflow-backstage
-  tag: latest
+  tag: phase7-fix4
   pullPolicy: Always
 
 service:
