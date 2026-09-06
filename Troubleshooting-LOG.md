@@ -1816,31 +1816,6 @@ MSYS_NO_PATHCONV=1 kubectl exec -n backstage deployment/backstage -- cat /app/ap
 
 ---
 
-## Issue 42 — Objects that do not survive `terraform destroy`
-
-**Symptom:** Multiple "not found" errors at session start on a rebuilt cluster — `namespaces backstage NOT FOUND`, `configmaps "rds-ca-bundle" not found`, ArgoCD account/RBAC missing.
-
-**Cause:** These are hand-created Kubernetes objects. They live only in the destroyed cluster's etcd — no repo, no Terraform state, no Helm chart.
-
-**Session-start checklist (before any `helm upgrade` of Backstage):**
-
-1. `kubectl create namespace backstage`
-2. `backstage-secrets` with all five keys — `GITHUB_TOKEN`, `POSTGRES_PASSWORD`, `AUTH_GITHUB_CLIENT_ID`, `AUTH_GITHUB_CLIENT_SECRET`, `ARGOCD_AUTH_TOKEN` *(regenerate the ArgoCD token first — see Issue 39)*
-3. `rds-ca-bundle` ConfigMap:
-   ```bash
-   curl -o /tmp/rds-ca-us-east-1.pem https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.pem
-   kubectl create configmap rds-ca-bundle -n backstage \
-     --from-file=rds-ca-us-east-1.pem=/tmp/rds-ca-us-east-1.pem
-   ```
-   The key name must be exactly `rds-ca-us-east-1.pem` — `app-config.production.yaml` reads `/etc/ssl/rds/rds-ca-us-east-1.pem`.
-4. ArgoCD account + RBAC patches on `argocd-cm` and `argocd-rbac-cm`, then `kubectl rollout restart deployment argocd-server -n argocd`
-5. metrics-server via Helm (Issue 36)
-6. Verify `taskflow` ECR images exist; rebuild if empty (Issue 33)
-
-**Proper fix (Phase 8):** move the namespace into Terraform, template the CA bundle into the Helm chart, and move the DB password to Secrets Manager via `manage_master_user_password`. That removes items 1–3 from the manual list.
-
----
-
 ## Phase 7 — configuration reference
 
 Final working `proxy` block in `app-config.production.yaml`:
@@ -1864,11 +1839,6 @@ Kubernetes plugin uses in-cluster service account auth (`https://kubernetes.defa
 Workload discovery depends on the `backstage.io/kubernetes-id: taskflow-app` label on both Deployments and both Services in `taskflow-gitops/charts/taskflow/templates/`, matching the `backstage.io/kubernetes-id` annotation in `taskflow-app/catalog-info.yaml`. `spec.selector` was deliberately left untouched — it is immutable on an existing Deployment.
 
 ---
-
-## Open items
-
-- **ArgoCD overview card does not render.** Only the history card appears. Both are registered via `EntityCardBlueprint` + `compatWrapper` under `pluginId: 'catalog'` in `App.tsx`. Likely an extension attachment-point issue in the new frontend system rather than a config or auth problem — the history card proves the plugin, the proxy, and the token all work.
-- **`taskflow` ECR repo emptied between sessions.** Lifecycle policy ruled out (`lastEvaluatedAt` is epoch). Suspect a Terraform destroy/recreate cycle on the repo resource. Confirm before the next rebuild.
 
 # Phase 8 — GitOps Delivery & Polish
 
