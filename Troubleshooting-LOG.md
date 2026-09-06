@@ -1869,3 +1869,523 @@ Workload discovery depends on the `backstage.io/kubernetes-id: taskflow-app` lab
 
 - **ArgoCD overview card does not render.** Only the history card appears. Both are registered via `EntityCardBlueprint` + `compatWrapper` under `pluginId: 'catalog'` in `App.tsx`. Likely an extension attachment-point issue in the new frontend system rather than a config or auth problem — the history card proves the plugin, the proxy, and the token all work.
 - **`taskflow` ECR repo emptied between sessions.** Lifecycle policy ruled out (`lastEvaluatedAt` is epoch). Suspect a Terraform destroy/recreate cycle on the repo resource. Confirm before the next rebuild.
+
+# Phase 8 — GitOps Delivery & Polish
+
+---
+
+## Issue 43 — Why `taskflow` ECR emptied between sessions but `taskflow-backstage` did not
+
+**Closes the Phase 7 open item.**
+
+**Symptom:** After every `terraform destroy`/`apply` cycle, the `taskflow` ECR repository
+came back empty, while `taskflow-backstage`, `taskflow-backend`, and `payments-api`
+retained all their images. Phase 7 ruled out the lifecycle policy (`lastEvaluatedAt` was
+epoch — it had never run) and left the cause unexplained.
+
+**Diagnosis:** Read what Terraform actually declares.
+
+```bash
+grep -n "aws_ecr_repository\|force_delete" *.tf
+```
+
+```
+ecr.tf:1  resource "aws_ecr_repository" "taskflow" {
+ecr.tf:4    force_delete = true
+```
+
+One repository is declared, and it carries `force_delete = true`. Confirmed against live
+AWS: `taskflow` did not exist at all after a destroy, while the other three showed
+creation dates predating multiple teardown cycles.
+
+**Cause:** `force_delete = true` instructs Terraform to delete the repository *and its
+images* on destroy. Every apply then recreates it empty. The other three repositories were
+created out-of-band — by CLI or CI — so no Terraform destroy has ever touched them. Their
+persistence is an accident of never having been managed, not a deliberate design.
+
+**Resolution:** Accepted as correct behaviour for this build. The images are rebuilt at
+session start from source, and `taskflow` holds at most two images per session. Making it
+persistent would require `prevent_destroy`, which causes `terraform destroy` to fail
+rather than complete — a worse outcome for an unattended teardown.
+
+**Takeaway:** "It persists" and "it is managed" are opposite properties here. The
+repository Terraform owns is the one that dies. Before theorising about lifecycle policies
+or registry behaviour, check whether the resource is in state at all.
+
+---
+
+## Issue 44 — ECR refuses to delete untagged images that are manifest-list children
+
+**Context:** `taskflow-backstage` had accumulated 48 images across weeks of rebuilds —
+10.9 GB, 42 of them untagged. Untagged images are orphans left when a rebuild moves a tag
+off an older image.
+
+**The near-miss:** The obvious cleanup is to delete everything untagged. Checking manifest
+types first showed why that would have been wrong:
+
+```bash
+aws ecr describe-images --repository-name taskflow-backstage --region us-east-1 \
+  --query 'imageDetails[].imageManifestMediaType' --output text | tr '\t' '\n' | sort | uniq -c
+```
+
+```
+16 application/vnd.oci.image.index.v1+json
+32 application/vnd.oci.image.manifest.v1+json
+```
+
+Sixteen **OCI image indexes**. An index is a pointer, not an image: BuildKit pushes an
+index whose children are the platform image plus attestation manifests (provenance, SBOM).
+Those children are stored as separate, untagged entries. Deleting all untagged images
+would have destroyed the children of tagged indexes, leaving tags pointing at broken
+manifests — discovered only on the next `docker pull`.
+
+**What actually happened:** ECR enforces this server-side. `batch-delete-image` deleted
+the true orphans and refused two entries:
+
+```json
+"failureCode": "ImageReferencedByManifestList",
+"failureReason": "Requested image referenced by manifest list: [sha256:6873d63f...]"
+```
+
+Tagged images verified intact afterwards.
+
+**Fix, and the durable one:** Manual cleanup is a chore that must be remembered. A
+lifecycle policy is the right answer:
+
+```json
+{
+  "rulePriority": 1,
+  "description": "Expire untagged images after 1 day",
+  "selection": {
+    "tagStatus": "untagged",
+    "countType": "sinceImagePushed",
+    "countUnit": "days",
+    "countNumber": 1
+  },
+  "action": { "type": "expire" }
+}
+```
+
+**Takeaway:** ECR's guardrail is real, but do not rely on discovering it by attempting the
+delete. Check `imageManifestMediaType` before any bulk image operation — the presence of
+`image.index` means untagged does not mean unreferenced. Note also that SHA-based tagging
+(adopted this phase) creates a new tag per build rather than moving one, so untagged
+orphans accumulate faster and the lifecycle policy matters more.
+
+---
+
+## Issue 45 — ArgoCD `--set configs.params.server.insecure=true` is silently ignored
+
+**Symptom:** ArgoCD installed via Helm with `--set configs.params.server.insecure=true`.
+The token-generation `curl` returned an empty body, and `python -c json.load` failed with
+`Expecting value: line 1 column 1 (char 0)`.
+
+**Diagnosis:** Check the status code rather than the body.
+
+```bash
+curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:8080/api/v1/session
+```
+
+`HTTP 307` — a redirect to HTTPS. `curl` without `-L` does not follow it, hence the empty
+body. ArgoCD was still in TLS mode; the insecure flag had not applied.
+
+**Cause:** `configs.params` is a **flat map whose keys contain literal dots**.
+`server.insecure` is one key name, not two levels of nesting. Written unescaped, Helm
+parses `--set configs.params.server.insecure=true` as three nested objects, which the
+chart ignores. No error is raised.
+
+**Fix:**
+
+```bash
+kubectl patch configmap argocd-cmd-params-cm -n argocd --type merge \
+  -p '{"data":{"server.insecure":"true"}}'
+kubectl rollout restart deployment argocd-server -n argocd
+```
+
+The escaped Helm form (`--set configs.params."server\.insecure"=true`) is equivalent, but
+a `helm upgrade` after any `kubectl patch` to `argocd-cm` or `argocd-rbac-cm` fails with
+a field-manager conflict:
+
+```
+conflict occurred while applying object argocd/argocd-rbac-cm:
+conflict with "kubectl-patch" using v1: .data.policy.csv
+```
+
+`--force` is deprecated, and `--force-replace` is rejected outright: *"cannot use
+server-side apply and force replace together."* On a cluster where the RBAC has already
+been patched by hand, the direct ConfigMap patch is the only path that works.
+
+**The verification trap — this cost four wasted commands.** The obvious check is wrong:
+
+```bash
+kubectl get deployment argocd-server -n argocd -o jsonpath='{.spec.template.spec.containers[0].args}'
+# ["/usr/local/bin/argocd-server","--port=8080","--metrics-port=8083"]
+```
+
+`--insecure` **never appears in the args.** In argo-cd chart 10.x the server reads
+`argocd-cmd-params-cm` at startup and applies the setting internally. Checking the args
+shows a normal, working deployment and reads as failure. The fix had already worked;
+subsequent `helm upgrade` attempts were chasing a phantom.
+
+**Correct verification:**
+
+```bash
+curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:8080/api/v1/session
+```
+
+`307` = still redirecting. `405` (Method Not Allowed on a POST-only endpoint) = plain HTTP
+is being served, which is the desired state.
+
+**Takeaways:**
+- Dots inside a Helm value **key** must be escaped in `--set`, or the value is dropped
+  silently. `configs.params`, `configs.cm`, and `configs.rbac` are all flat maps of
+  dotted keys.
+- **Verify against the running server, not the manifest.** A setting consumed from a
+  ConfigMap at startup leaves no trace in the Deployment spec.
+- Once a chart-managed object has been `kubectl patch`ed, `helm upgrade` on that release
+  is effectively blocked. Either manage everything through Helm values, or accept that
+  those objects are hand-maintained session-start items.
+
+---
+
+## Issue 46 — The ArgoCD overview card was never broken; the hand-registration was
+
+**Reverses the Phase 7 open item**, which recorded the opposite conclusion.
+
+**Phase 7's belief:** the overview card did not render while the history card did, and the
+cause was assumed to be an extension attachment-point problem in the new frontend system.
+
+**What was actually happening:** `App.tsx` hand-registered both cards via
+`EntityCardBlueprint` + `compatWrapper` under `pluginId: 'catalog'`, with the filter
+`'has:annotation:argocd/app-name'`. The browser console showed:
+
+```
+Error(s) in entity filter expression 'has:annotation:argocd/app-name'
+[InputError: 'annotation:argocd/app-name' is not a valid parameter for 'has' filter expressions]
+```
+
+`has:` does not accept `annotation:` as a parameter. The filter threw, and both
+hand-registered cards were skipped — silently, because a filter error does not blank the
+page, it just declines to mount the extension.
+
+Meanwhile the console listed **four** card extensions, not two:
+
+```
+'entity-card:argocd/overviewCard'      ← from the plugin
+'entity-card:argocd/historyCard'       ← from the plugin
+'entity-card:catalog/argocd-overview'  ← hand-registered
+'entity-card:catalog/argocd-history'   ← hand-registered
+```
+
+The Roadie plugin registers its own cards. The card visible in Phase 7 was always the
+plugin's, never the hand-written one. On the Overview page this produced **two identical
+ArgoCD overview cards** side by side — the duplication that made the mechanism obvious.
+
+**Cause:** the plugin ships full new frontend system support. `package.json` declares it:
+
+```json
+"./alpha": {
+  "backstage": "@backstage/FrontendPlugin",
+  "import": "./dist/alpha.esm.js"
+}
+```
+
+`"backstage": "@backstage/FrontendPlugin"` marks an alpha entrypoint exporting a
+new-system plugin — the same shape as `@backstage/plugin-catalog/alpha`. Nothing needed
+hand-registering.
+
+**Fix:** delete both hand-registrations and the `createFrontendModule({ pluginId:
+'catalog' })` block, and add the plugin to the features array:
+
+```tsx
+import argocdPlugin from '@roadiehq/backstage-plugin-argo-cd/alpha';
+
+export default createApp({
+  features: [
+    catalogPlugin,
+    techDocsPlugin,
+    techDocsMermaidAddonModule,
+    kubernetesPlugin,
+    argocdPlugin,
+    navModule,
+    createFrontendModule({ pluginId: 'app', extensions: [signInPage] }),
+  ],
+});
+```
+
+The unused `EntityCardBlueprint`, `useEntity`, and `compatWrapper` imports were removed
+with it.
+
+**Result:** one overview card, no filter error, clean console.
+
+**Takeaways:**
+- **Check whether a plugin already registers its own extensions before writing a
+  registration.** Look for an `/alpha` entrypoint with `"backstage":
+  "@backstage/FrontendPlugin"` in its `package.json` exports. Hand-registering alongside
+  it produces duplicates, and the duplicate is the clue.
+- **A silent missing card is a filter error until proven otherwise.** The browser console
+  named the exact problem; three phases of speculation about attachment points did not.
+  Open DevTools before theorising.
+- The Phase 7 diagnosis was confidently wrong and stayed in the log as an open item for a
+  full phase. An unresolved item worth revisiting is worth revisiting with fresh evidence,
+  not with the previous session's assumptions.
+
+---
+
+## Issue 47 — Roadie ArgoCD history card renders empty against multi-source Applications
+
+**Symptom:** With the plugin registering its own cards, the overview card rendered
+correctly but no history card appeared anywhere. No console error.
+
+**Diagnosis:** The data exists. `status.history` on `taskflow-prod`:
+
+```json
+{
+    "deployStartedAt": "2026-09-06T09:29:09Z",
+    "deployedAt": "2026-09-06T09:29:37Z",
+    "id": 0,
+    "initiatedBy": { "automated": true },
+    "revisions": ["0179eb50be992f90f590ec1011187cfea65deeec", "..."],
+    "source": { "repoURL": "" },
+    "sources": [
+        { "ref": "values", "repoURL": "https://github.com/OnyiGlobal2025/taskflow-gitops", "targetRevision": "main" },
+        { "path": "charts/taskflow", "repoURL": "https://github.com/OnyiGlobal2025/taskflow-gitops", "targetRevision": "main" }
+    ]
+}
+```
+
+Every field is populated except `source`, which is an empty object.
+
+**Cause:** `taskflow-*` Applications are generated by an ApplicationSet using
+**multi-source** (`sources`, plural — a `values` ref plus the chart path). ArgoCD
+populates `sources` and leaves the singular `source` empty. The Roadie history card was
+written against the single-source shape and reads `source.repoURL` to resolve commit
+metadata. With an empty repoURL it has nothing to render.
+
+An earlier symptom — `Uncaught TypeError: Cannot read properties of undefined (reading
+'startTime')` — appeared while the invalid-filter registrations were still present and
+did not recur after Issue 46's fix.
+
+**Resolution:** Accepted as a plugin limitation, not worked around. The overview card
+provides sync status, health status, and last-synced time, which is the meaningful portal
+integration. The `backstage` Application created in this phase uses a **single** source
+and is not affected.
+
+**Takeaway:** Multi-source ArgoCD Applications are comparatively recent, and plugins
+written against the single-source API can fail on them without erroring — the empty
+`source` object reads as valid data with no content. When a card renders blank against a
+healthy backend, compare the API response shape against what the component expects before
+assuming a registration or auth fault.
+
+---
+
+## Issue 48 — Handing a live Helm release over to ArgoCD
+
+**Context:** Backstage had been deployed by direct `helm upgrade` since Phase 3. Step 4 of
+this phase moved it under ArgoCD management. The risk: ArgoCD claiming resources Helm
+already owns, mid-flight, on a running pod.
+
+**Sequence used:**
+
+1. **A separate `platform` AppProject**, not a widened `taskflow` project. The existing
+   project permits only the `taskflow-gitops` repo and the three `taskflow-*` namespaces;
+   Backstage lives in another repo and another namespace. Widening it would let the
+   application project deploy into the platform namespace — a boundary worth keeping.
+
+2. **Application created with `automated` sync deliberately absent.** ArgoCD reported
+   `OutOfSync`/`Healthy` and took no action, giving an observation window.
+
+3. **Inspected the diff before syncing:**
+
+```bash
+kubectl get application backstage -n argocd \
+  -o jsonpath='{range .status.resources[*]}{.kind}{"/"}{.name}{" -> "}{.status}{"\n"}{end}'
+```
+
+```
+Service/backstage                              -> OutOfSync
+ServiceAccount/backstage                       -> OutOfSync
+Deployment/backstage                           -> OutOfSync
+ClusterRole/backstage-kubernetes-reader        -> Unknown
+ClusterRoleBinding/backstage-kubernetes-reader -> Unknown
+```
+
+`Unknown` on the two cluster-scoped resources: the project's `clusterResourceWhitelist`
+permitted only `Namespace`, so ArgoCD could not manage them. Left unfixed, the Kubernetes
+plugin's RBAC would have sat outside GitOps control. Added `ClusterRole` and
+`ClusterRoleBinding` explicitly rather than `kind: '*'` — the whitelist is the project's
+blast radius, and naming the two kinds the chart actually creates keeps it meaningful.
+
+4. **Synced.** Because ArgoCD renders the same chart into the same namespace under the
+   same release name, the manifests matched: `Synced`/`Healthy`, pod age unchanged, zero
+   restarts. Ownership transferred with no disruption.
+
+5. **Enabled `automated: { prune: true, selfHeal: true }`** and verified end to end by
+   pushing `replicaCount: 2` to the chart. A second pod reached `1/1 Running` within ~3
+   minutes with no `helm` command run. Reverted to 1 and watched it scale back down.
+
+**Note on `image.tag`:** the chart's `values.yaml` carries `tag: ""` (see Issue 49), so the
+Application supplies it as a Helm parameter. The Application manifest is therefore the
+GitOps record of which image is deployed.
+
+**Not under ArgoCD management:** `backstage-secrets` and the `rds-ca-bundle` ConfigMap are
+hand-created and outside the chart, so ArgoCD neither manages nor prunes them. They remain
+session-start items.
+
+**Takeaway:** Handing a live release to ArgoCD is safe when both render identical
+manifests, but that must be *verified* rather than assumed. Creating the Application
+without an automated sync policy costs nothing and turns an irreversible action into an
+inspectable one.
+
+---
+
+## Issue 49 — Commit-SHA image tags and the clean-tree guard
+
+**Change:** replaced manual `phase7-fixN` tags with `git rev-parse --short HEAD`.
+
+**Why manual tags were a problem:** `phase7-fix4` is a label with no relationship to the
+code inside the image. The ECR repository is `MUTABLE`, so rebuilding under the same tag
+silently replaces it — two different builds can share a name. When a pod misbehaves, the
+tag answers nothing.
+
+**Why a guard is required:** a SHA tag describes the *last commit*. Building with
+uncommitted changes produces an image whose tag names a commit that does not contain the
+code shipped. That is worse than a meaningless tag, because it will be trusted later.
+
+`scripts/build-and-push.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGISTRY="713923090919.dkr.ecr.us-east-1.amazonaws.com"
+REPO="taskflow-backstage"
+REGION="us-east-1"
+
+# --- Guard: refuse to tag an image with a SHA that doesn't describe its contents
+if ! git diff-index --quiet HEAD --; then
+  echo "ERROR: uncommitted changes. A SHA tag would describe the wrong code."
+  git status --short
+  exit 1
+fi
+
+TAG=$(git rev-parse --short HEAD)
+IMAGE="${REGISTRY}/${REPO}:${TAG}"
+
+echo "==> Building ${IMAGE}"
+
+yarn tsc
+yarn build:backend
+
+aws ecr get-login-password --region "${REGION}" \
+  | docker login --username AWS --password-stdin "${REGISTRY}"
+
+docker build . -f packages/backend/Dockerfile -t "${IMAGE}"
+docker push "${IMAGE}"
+
+echo ""
+echo "==> Pushed ${IMAGE}"
+echo "==> Deploy with:"
+echo "helm upgrade --install backstage ./helm/backstage -n backstage --set image.tag=${TAG}"
+```
+
+`git diff-index --quiet HEAD --` exits non-zero when tracked files differ from HEAD.
+Untracked files do not trip it.
+
+The script also runs `yarn tsc && yarn build:backend` before `docker build`, because
+Issue 23's stale-bundle failure is a forgetting problem and automation removes the chance
+to forget.
+
+**Chart change:** `helm/backstage/values.yaml` now carries `tag: ""` rather than a
+literal. Hardcoding a SHA into a versioned file is circular — committing the file changes
+the SHA. The tag is supplied at deploy time (`--set image.tag=...`) or, now, by the ArgoCD
+Application's Helm parameters.
+
+**Note:** SHA tagging is not a CI-only technique. `git rev-parse` is a local git command;
+CI uses it for the same reason a laptop should.
+
+---
+
+## Issue 42 (revised) — Objects that do not survive `terraform destroy`
+
+*Supersedes the Phase 7 version — delete that one rather than keeping both. Reordered to
+reflect actual dependencies: the ArgoCD account and RBAC must exist before a token can be
+generated, and the token is needed before the secret can be created.*
+
+**Session-start checklist:**
+
+1. `terraform apply` in `taskflow-infra/terraform/`, then
+   `aws eks update-kubeconfig --name taskflow-eks-cluster --region us-east-1`
+
+2. `kubectl create namespace backstage` and `kubectl create namespace argocd`
+
+3. Install ArgoCD via Helm, then apply the insecure setting **directly to the ConfigMap**
+   (Issue 45 — the `--set` form is silently dropped):
+   ```bash
+   kubectl patch configmap argocd-cmd-params-cm -n argocd --type merge \
+     -p '{"data":{"server.insecure":"true"}}'
+   kubectl rollout restart deployment argocd-server -n argocd
+   ```
+   Verify with a `curl` against the server, not the deployment args.
+
+4. ArgoCD account + RBAC patches on `argocd-cm` and `argocd-rbac-cm`, then restart
+   `argocd-server` (Issue 39)
+
+5. Generate a fresh ArgoCD token — **tokens are cluster-scoped and never survive a
+   rebuild** (Issue 39). Keep it in a shell variable; never paste it by hand.
+
+6. `rds-ca-bundle` ConfigMap:
+   ```bash
+   curl -o /tmp/rds-ca-us-east-1.pem https://truststore.pki.rds.amazonaws.com/us-east-1/us-east-1-bundle.pem
+   head -1 /tmp/rds-ca-us-east-1.pem   # must print -----BEGIN CERTIFICATE-----
+   kubectl create configmap rds-ca-bundle -n backstage \
+     --from-file=rds-ca-us-east-1.pem=/tmp/rds-ca-us-east-1.pem
+   ```
+
+7. `backstage-secrets` with all five keys, `ARGOCD_AUTH_TOKEN` passed as `"$BACKSTAGE_TOKEN"`.
+   Verify lengths — `DATA 5` proves keys exist, not content (Issue 19).
+
+8. metrics-server via Helm (Issue 36)
+
+9. Rebuild and push the `taskflow` backend and frontend images — the repository is
+   recreated empty every cycle (Issue 43). Tags must match
+   `taskflow-gitops/envs/*/values.yaml`: `backend-phase7`, `frontend-phase7`.
+
+10. Apply `argocd/project.yaml`, then `argocd/platform-project.yaml`, then
+    `argocd/applicationset.yaml`, then `argocd/backstage-application.yaml`.
+    **Project before Application, always** (Issue 31).
+
+11. Re-run the four TechDocs workflows (`workflow_dispatch` from the Actions tab) — the S3
+    bucket carries `force_destroy = true` and is emptied with the cluster.
+
+12. Deploy Backstage. Once the ArgoCD Application exists with automated sync, this happens
+    on its own; a manual
+    `helm upgrade --install backstage ./helm/backstage -n backstage --set image.tag=<sha>`
+    is only needed to bootstrap before ArgoCD is running.
+
+**Teardown:** delete any LoadBalancer/ingress services first to avoid orphaned ALBs
+blocking VPC teardown, then `terraform destroy`.
+
+---
+
+## Phase 8 — Open items
+
+- **`taskflow` ECR emptied between sessions.** RESOLVED — Issue 43. `force_delete = true`
+  on the only Terraform-managed repository.
+
+- **ArgoCD overview card does not render.** RESOLVED — Issue 46. The diagnosis was
+  inverted: the overview card worked all along, and the hand-registered cards never
+  mounted due to an invalid filter expression.
+
+- **Roadie history card renders empty against multi-source Applications** (Issue 47).
+  Accepted, not fixed. Would require a plugin patch or converting the ApplicationSet to
+  single-source.
+
+- **TechDocs S3 bucket is destroyed with the cluster.** Deliberately accepted for this
+  build — the bucket costs under a cent per month, and republishing is four
+  `workflow_dispatch` runs. A persistent/ephemeral Terraform state split would remove it
+  but was descoped as disproportionate for a portfolio project.
+
+- **ArgoCD `server.insecure`, account, and RBAC live in `kubectl` patches, not Helm
+  values.** Any successful `helm upgrade` on the ArgoCD release would reset them. Moving
+  all three into a `values.yaml` for the release would make one `helm install` sufficient.
