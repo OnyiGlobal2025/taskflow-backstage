@@ -110,6 +110,7 @@ ownership, repository location, review — that generates a real GitHub reposito
 
 ![The golden-path template form](docs/images/template-form.png)
 
+
 ![Scaffolder task execution — skeleton rendered, repository created, catalog registered](docs/images/template-execution.png)
 
 The template is locked to the `OnyiGlobal2025` org via `allowedOwners`, and registered in
@@ -269,4 +270,4 @@ then `terraform destroy`.
 ---
 
 Built by [Onyedika Okoro](https://linkedin.com/in/onyedika-okoro) — Platform & Cloud
-Engineer. Full write-up: `[ADD HASHNODE URL]`
+Engineer. Full write-up: https://onyiglobal2025.hashnode.dev/i-built-an-internal-developer-portal-on-eks-three-bugs-taught-me-more-than-the-build-did
