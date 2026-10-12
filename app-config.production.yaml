@@ -26,15 +26,26 @@ backend:
           $file: /etc/ssl/rds/rds-ca-us-east-1.pem
 
 catalog:
+  # OLD (superseded in Step 2.2): static URLs for the four TaskFlow components.
+  # Replaced by providers.github below, which discovers every catalog-info.yaml
+  # in the OnyiGlobal2025 org. Static URLs were lost on every cluster rebuild
+  # (payments-api was never in this list) and kept polling deleted or renamed
+  # repos. Kept commented for reference.
+  #
+  # locations:
+  #   - type: url
+  #     target: https://github.com/OnyiGlobal2025/taskflow-app/blob/main/catalog-info.yaml
+  #   - type: url
+  #     target: https://github.com/OnyiGlobal2025/taskflow-backstage/blob/main/catalog-info.yaml
+  #   - type: url
+  #     target: https://github.com/OnyiGlobal2025/taskflow-gitops/blob/main/catalog-info.yaml
+  #   - type: url
+  #     target: https://github.com/OnyiGlobal2025/taskflow-infra/blob/main/catalog-info.yaml
+
+  # NEW (Step 2.2): static locations kept only for files discovery cannot find.
+  # catalog-org.yaml is not named catalog-info.yaml, and the template is not a
+  # catalog-info.yaml either, so both stay explicit.
   locations:
-    - type: url
-      target: https://github.com/OnyiGlobal2025/taskflow-app/blob/main/catalog-info.yaml
-    - type: url
-      target: https://github.com/OnyiGlobal2025/taskflow-backstage/blob/main/catalog-info.yaml
-    - type: url
-      target: https://github.com/OnyiGlobal2025/taskflow-gitops/blob/main/catalog-info.yaml
-    - type: url
-      target: https://github.com/OnyiGlobal2025/taskflow-infra/blob/main/catalog-info.yaml
     - type: url
       target: https://github.com/OnyiGlobal2025/taskflow-backstage/blob/main/catalog-org.yaml
       rules:
@@ -43,6 +54,21 @@ catalog:
       target: https://github.com/OnyiGlobal2025/taskflow-backstage/blob/main/scaffolder-templates/service/template.yaml
       rules:
         - allow: [Template]
+
+  # NEW (Step 2.2): GitHub discovery. Crawls every repo in the org on main and
+  # registers any catalog-info.yaml it finds. No repository filter, on purpose:
+  # a prefix like ^taskflow- would exclude payments-api and any future scaffolded repo.
+  # The token comes from integrations.github in app-config.yaml (see Step 2.2 note).
+  providers:
+    github:
+      taskflow-org:
+        organization: 'OnyiGlobal2025'
+        catalogPath: '/catalog-info.yaml'
+        filters:
+          branch: 'main'
+        schedule:
+          frequency: { minutes: 30 }
+          timeout: { minutes: 3 }
 
 techdocs:
   # 'external' means Backstage never builds docs itself — CI does, and
