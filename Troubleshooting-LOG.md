@@ -2359,3 +2359,15 @@ blocking VPC teardown, then `terraform destroy`.
 - **ArgoCD `server.insecure`, account, and RBAC live in `kubectl` patches, not Helm
   values.** Any successful `helm upgrade` on the ArgoCD release would reset them. Moving
   all three into a `values.yaml` for the release would make one `helm install` sufficient.
+
+## Issue 50 — Static catalog locations vs GitHub discovery
+
+Static `catalog.locations` URLs were lost on every cluster rebuild, so `payments-api` vanished from the catalog. GitHub discovery fixed it. The old `locations` block is kept commented in `app-config.production.yaml`.
+
+## Issue 51 — RDS master password mismatch after rebuild
+
+Backstage failed with `password authentication failed for user "backstage_admin"`. The RDS master password is supplied at apply time, so it did not match the value stored in `backstage-secrets`. Fixed by resetting the master password with `aws rds modify-db-instance`, patching `POSTGRES_PASSWORD` in the secret, and restarting the deployment.
+
+## Issue 52 — `terraform apply` DNS timeout left a partial apply
+
+The EKS cluster failed with `no such host` for `eks.us-east-1.amazonaws.com`, while RDS was created. The DNS lookup was flaky and succeeded on retry. Re-running `terraform apply` was safe because Terraform kept state for the resources already created.
